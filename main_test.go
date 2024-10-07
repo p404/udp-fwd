@@ -40,18 +40,21 @@ func TestHandleConnections(t *testing.T) {
 	// Create real UDP connections for destinations
 	destConns := make([]DestinationConn, 2)
 	for i := range destConns {
-		// Create a local address to listen on
-		addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+		// Create a mock server to receive packets
+		serverAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
 		assert.NoError(t, err)
+		serverConn, err := net.ListenUDP("udp", serverAddr)
+		assert.NoError(t, err)
+		defer serverConn.Close()
 
-		// Use ListenUDP to create a UDP connection
-		conn, err := net.ListenUDP("udp", addr)
+		// Create a client connection to the mock server
+		clientConn, err := net.DialUDP("udp", nil, serverConn.LocalAddr().(*net.UDPAddr))
 		assert.NoError(t, err)
-		defer conn.Close()
+		defer clientConn.Close()
 
 		destConns[i] = DestinationConn{
-			conn: conn,
-			addr: conn.LocalAddr().String(),
+			conn: clientConn,
+			addr: serverConn.LocalAddr().String(),
 		}
 	}
 
@@ -92,9 +95,13 @@ func TestForwardPacket(t *testing.T) {
 	defer serverConn.Close()
 
 	// Create a DestinationConn
+	clientConn, err := net.DialUDP("udp", nil, serverConn.LocalAddr().(*net.UDPAddr))
+	assert.NoError(t, err)
+	defer clientConn.Close()
+
 	destConn := DestinationConn{
-		conn: serverConn,
-		addr: serverConn.LocalAddr().String(),
+		conn: clientConn,
+		addr: clientConn.RemoteAddr().String(),
 	}
 
 	// Run forwardPacket

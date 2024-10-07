@@ -58,7 +58,11 @@ func main() {
 
 	destConns := make([]DestinationConn, len(destinations))
 	for i, dest := range destinations {
-		conn, err := net.Dial("udp", dest)
+		addr, err := net.ResolveUDPAddr("udp", dest)
+		if err != nil {
+			log.Fatal().Err(err).Str("destination", dest).Msg("Failed to resolve destination address")
+		}
+		conn, err := net.DialUDP("udp", nil, addr)
 		if err != nil {
 			log.Fatal().Err(err).Str("destination", dest).Msg("Failed to connect to destination")
 		}
@@ -175,7 +179,7 @@ func handleConnections(ctx context.Context, conn UDPConn, destConns []Destinatio
 			}
 
 			packetsReceived.Inc()
-			log.Debug().Str("remote_addr", remoteAddr.String()).Msg("Received packet")
+			log.Debug().Str("remote_addr", remoteAddr.String()).Int("bytes", n).Msg("Received packet")
 
 			for _, destConn := range destConns {
 				go forwardPacket(buffer[:n], destConn)
@@ -192,20 +196,19 @@ func forwardPacket(packet []byte, destConn DestinationConn) {
 
 	// Check if the connection is a UDP connection
 	if udpConn, ok := destConn.conn.(*net.UDPConn); ok {
-		// For ListenUDP connections, we need to use WriteToUDP
-		addr, err := net.ResolveUDPAddr("udp", destConn.addr)
-		if err != nil {
-			log.Error().Err(err).Str("destination", destConn.addr).Msg("Failed to resolve UDP address")
-			return
-		}
-		n, err = udpConn.WriteToUDP(packet, addr)
+		n, err = udpConn.Write(packet)
 	} else {
+		// For other types of connections, use Write
 		n, err = destConn.conn.Write(packet)
 	}
 
 	if err != nil {
 		log.Error().Err(err).Str("destination", destConn.addr).Int("packet_size", len(packet)).Msg("Error forwarding packet")
 		return
+	}
+
+	if n != len(packet) {
+		log.Warn().Str("destination", destConn.addr).Int("sent", n).Int("expected", len(packet)).Msg("Incomplete packet sent")
 	}
 
 	packetsForwarded.WithLabelValues(destConn.addr).Inc()
