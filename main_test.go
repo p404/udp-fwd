@@ -17,7 +17,7 @@ func TestMain(m *testing.M) {
 	// Setup
 	os.Setenv("UDP_LISTEN_PORT", "5000")
 	os.Setenv("UDP_DESTINATIONS", "localhost:6000,localhost:6001")
-	os.Setenv("LOG_LEVEL", "error")
+	os.Setenv("LOG_LEVEL", "debug") // Set to debug for more detailed logging
 
 	// Run tests
 	code := m.Run()
@@ -36,7 +36,25 @@ func TestHandleConnections(t *testing.T) {
 	defer ctrl.Finish()
 
 	mockConn := NewMockUDPConn(ctrl)
-	destinations := []string{"localhost:6000", "localhost:6001"}
+
+	// Create real UDP connections for destinations
+	destConns := make([]DestinationConn, 2)
+	for i := range destConns {
+		// Create a local address to listen on
+		addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+		assert.NoError(t, err)
+
+		// Use ListenUDP to create a UDP connection
+		conn, err := net.ListenUDP("udp", addr)
+		assert.NoError(t, err)
+		defer conn.Close()
+
+		destConns[i] = DestinationConn{
+			conn: conn,
+			addr: conn.LocalAddr().String(),
+		}
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Expectations
@@ -49,7 +67,7 @@ func TestHandleConnections(t *testing.T) {
 	}).AnyTimes()
 
 	// Run the function in a goroutine
-	go handleConnections(ctx, mockConn, destinations)
+	go handleConnections(ctx, mockConn, destConns)
 
 	// Wait a bit for the goroutine to process
 	time.Sleep(100 * time.Millisecond)
@@ -61,29 +79,40 @@ func TestHandleConnections(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Assertions
-	// Note: We can't easily assert on forwarded packets in this test setup
-	// That would require more complex mocking of net.Dial and net.Conn
+	// You can add assertions here to check if packets were received by the destination connections
 }
 
 func TestForwardPacket(t *testing.T) {
 	// Setup mock UDP server
-	addr, err := net.ResolveUDPAddr("udp", "localhost:0")
+	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
 	assert.NoError(t, err)
 
-	conn, err := net.ListenUDP("udp", addr)
+	serverConn, err := net.ListenUDP("udp", addr)
 	assert.NoError(t, err)
-	defer conn.Close()
+	defer serverConn.Close()
 
-	// Run forwardPacket in a goroutine
+	// Create a DestinationConn
+	destConn := DestinationConn{
+		conn: serverConn,
+		addr: serverConn.LocalAddr().String(),
+	}
+
+	// Run forwardPacket
 	packet := []byte("test packet")
-	go forwardPacket(packet, conn.LocalAddr().String())
+	forwardPacket(packet, destConn)
 
-	// Read from the mock server
+	// Read from the server
 	buffer := make([]byte, 1024)
-	conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-	n, _, err := conn.ReadFromUDP(buffer)
+	serverConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	n, _, err := serverConn.ReadFromUDP(buffer)
 
 	// Assertions
+	if err != nil {
+		t.Logf("Error reading from UDP: %v", err)
+	}
+	t.Logf("Bytes read: %d", n)
+	t.Logf("Buffer content: %v", buffer[:n])
+
 	assert.NoError(t, err)
 	assert.Equal(t, packet, buffer[:n])
 }

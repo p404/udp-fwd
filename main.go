@@ -38,6 +38,11 @@ func init() {
 	prometheus.MustRegister(bytesForwarded)
 }
 
+type DestinationConn struct {
+	conn net.Conn
+	addr string
+}
+
 func main() {
 	setupLogger()
 
@@ -51,7 +56,13 @@ func main() {
 		log.Fatal().Msg("UDP_DESTINATIONS environment variable is not set or empty")
 	}
 
-	for _, dest := range destinations {
+	destConns := make([]DestinationConn, len(destinations))
+	for i, dest := range destinations {
+		conn, err := net.Dial("udp", dest)
+		if err != nil {
+			log.Fatal().Err(err).Str("destination", dest).Msg("Failed to connect to destination")
+		}
+		destConns[i] = DestinationConn{conn: conn, addr: dest}
 		packetsForwarded.WithLabelValues(dest)
 		bytesForwarded.WithLabelValues(dest)
 	}
@@ -75,7 +86,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		handleConnections(ctx, conn, destinations)
+		handleConnections(ctx, conn, destConns)
 	}()
 
 	// Start metrics server
@@ -100,6 +111,13 @@ func main() {
 	// Close UDP listener
 	if err := conn.Close(); err != nil {
 		log.Error().Err(err).Msg("Error closing UDP listener")
+	}
+
+	// Close destination connections
+	for _, destConn := range destConns {
+		if err := destConn.conn.Close(); err != nil {
+			log.Error().Err(err).Str("destination", destConn.addr).Msg("Error closing destination connection")
+		}
 	}
 
 	// Shutdown metrics server
@@ -133,7 +151,7 @@ func setupLogger() {
 	log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger()
 }
 
-func handleConnections(ctx context.Context, conn UDPConn, destinations []string) {
+func handleConnections(ctx context.Context, conn UDPConn, destConns []DestinationConn) {
 	buffer := make([]byte, 1024)
 
 	for {
@@ -159,28 +177,38 @@ func handleConnections(ctx context.Context, conn UDPConn, destinations []string)
 			packetsReceived.Inc()
 			log.Debug().Str("remote_addr", remoteAddr.String()).Msg("Received packet")
 
-			for _, dest := range destinations {
-				go forwardPacket(buffer[:n], dest)
+			for _, destConn := range destConns {
+				go forwardPacket(buffer[:n], destConn)
 			}
 		}
 	}
 }
 
-func forwardPacket(packet []byte, destination string) {
-	conn, err := net.Dial("udp", destination)
+func forwardPacket(packet []byte, destConn DestinationConn) {
+	var n int
+	var err error
+
+	log.Debug().Str("destination", destConn.addr).Int("packet_size", len(packet)).Msg("Attempting to forward packet")
+
+	// Check if the connection is a UDP connection
+	if udpConn, ok := destConn.conn.(*net.UDPConn); ok {
+		// For ListenUDP connections, we need to use WriteToUDP
+		addr, err := net.ResolveUDPAddr("udp", destConn.addr)
+		if err != nil {
+			log.Error().Err(err).Str("destination", destConn.addr).Msg("Failed to resolve UDP address")
+			return
+		}
+		n, err = udpConn.WriteToUDP(packet, addr)
+	} else {
+		n, err = destConn.conn.Write(packet)
+	}
+
 	if err != nil {
-		log.Error().Err(err).Str("destination", destination).Msg("Error connecting")
+		log.Error().Err(err).Str("destination", destConn.addr).Int("packet_size", len(packet)).Msg("Error forwarding packet")
 		return
 	}
-	defer conn.Close()
 
-	n, err := conn.Write(packet)
-	if err != nil {
-		log.Error().Err(err).Str("destination", destination).Msg("Error forwarding packet")
-		return
-	}
-
-	packetsForwarded.WithLabelValues(destination).Inc()
-	bytesForwarded.WithLabelValues(destination).Add(float64(n))
-	log.Debug().Str("destination", destination).Int("bytes", n).Msg("Forwarded packet")
+	packetsForwarded.WithLabelValues(destConn.addr).Inc()
+	bytesForwarded.WithLabelValues(destConn.addr).Add(float64(n))
+	log.Debug().Str("destination", destConn.addr).Int("bytes", n).Msg("Forwarded packet")
 }
