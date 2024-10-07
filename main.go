@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -18,6 +19,7 @@ import (
 )
 
 var (
+	registry        = prometheus.NewRegistry()
 	packetsReceived = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "udp_fwd_packets_received_total",
 		Help: "Total number of UDP packets received",
@@ -33,9 +35,9 @@ var (
 )
 
 func init() {
-	prometheus.MustRegister(packetsReceived)
-	prometheus.MustRegister(packetsForwarded)
-	prometheus.MustRegister(bytesForwarded)
+	registry.MustRegister(packetsReceived)
+	registry.MustRegister(packetsForwarded)
+	registry.MustRegister(bytesForwarded)
 }
 
 type DestinationConn struct {
@@ -45,6 +47,19 @@ type DestinationConn struct {
 
 func main() {
 	setupLogger()
+
+	// Check if Go metrics should be enabled
+	enableGoMetrics := os.Getenv("PROM_GO_METRICS")
+	if enableGoMetrics == "true" {
+		registry.MustRegister(collectors.NewGoCollector())
+		log.Info().Msg("Go metrics enabled")
+	} else {
+		if enableGoMetrics == "" {
+			log.Info().Msg("PROM_GO_METRICS not set. Go metrics disabled")
+		} else {
+			log.Info().Msg("Go metrics disabled")
+		}
+	}
 
 	listenPort := os.Getenv("UDP_LISTEN_PORT")
 	if listenPort == "" {
@@ -95,7 +110,7 @@ func main() {
 
 	// Start metrics server
 	srv := &http.Server{Addr: ":8080"}
-	http.Handle("/metrics", promhttp.Handler())
+	http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
 	go func() {
 		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 			log.Error().Err(err).Msg("Metrics server failed")
@@ -161,6 +176,7 @@ func handleConnections(ctx context.Context, conn UDPConn, destConns []Destinatio
 	for {
 		select {
 		case <-ctx.Done():
+			log.Debug().Msg("Stopping UDP packet handling")
 			return
 		default:
 			err := conn.SetReadDeadline(time.Now().Add(1 * time.Second))
@@ -171,9 +187,15 @@ func handleConnections(ctx context.Context, conn UDPConn, destConns []Destinatio
 
 			n, remoteAddr, err := conn.ReadFromUDP(buffer)
 			if err != nil {
+				if ctx.Err() != nil {
+					// Context cancelled, time to exit
+					return
+				}
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					// This is a timeout, just continue to the next iteration
 					continue
 				}
+				// Log other errors, but don't exit
 				log.Error().Err(err).Msg("Error reading UDP packet")
 				continue
 			}
