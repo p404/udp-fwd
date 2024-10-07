@@ -55,7 +55,7 @@ func main() {
 		log.Info().Msg("Go metrics enabled")
 	} else {
 		if enableGoMetrics == "" {
-			log.Info().Msg("PROM_GO_METRICS not set. Go metrics disabled")
+			log.Info().Msg("PROM_GO_METRICS not set. Go Prometheus metrics disabled")
 		} else {
 			log.Info().Msg("Go metrics disabled")
 		}

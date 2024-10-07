@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"testing"
@@ -122,4 +123,61 @@ func TestForwardPacket(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.Equal(t, packet, buffer[:n])
+}
+
+func TestForwardPacketsWithDifferentSizes(t *testing.T) {
+	// Setup mock UDP servers (destinations)
+	destCount := 2
+	servers := make([]*net.UDPConn, destCount)
+	destConns := make([]DestinationConn, destCount)
+
+	for i := 0; i < destCount; i++ {
+		addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+		assert.NoError(t, err)
+
+		serverConn, err := net.ListenUDP("udp", addr)
+		assert.NoError(t, err)
+		defer serverConn.Close()
+
+		servers[i] = serverConn
+
+		clientConn, err := net.DialUDP("udp", nil, serverConn.LocalAddr().(*net.UDPAddr))
+		assert.NoError(t, err)
+		defer clientConn.Close()
+
+		destConns[i] = DestinationConn{
+			conn: clientConn,
+			addr: clientConn.RemoteAddr().String(),
+		}
+	}
+
+	// Test different packet sizes
+	testSizes := []int{10, 100, 500, 1000, 1500}
+
+	for _, size := range testSizes {
+		t.Run(fmt.Sprintf("PacketSize_%d", size), func(t *testing.T) {
+			packet := make([]byte, size)
+			for i := range packet {
+				packet[i] = byte(i % 256)
+			}
+
+			// Forward packet to all destinations
+			for _, destConn := range destConns {
+				forwardPacket(packet, destConn)
+			}
+
+			// Check if all destinations received the correct packet
+			for i, server := range servers {
+				buffer := make([]byte, 2000) // Larger than the max test size
+				server.SetReadDeadline(time.Now().Add(1 * time.Second))
+				n, _, err := server.ReadFromUDP(buffer)
+
+				assert.NoError(t, err, "Error reading from UDP for destination %d", i)
+				assert.Equal(t, size, n, "Incorrect number of bytes read for destination %d", i)
+				assert.Equal(t, packet, buffer[:n], "Incorrect packet content for destination %d", i)
+
+				t.Logf("Destination %d received %d bytes", i, n)
+			}
+		})
+	}
 }
