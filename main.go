@@ -2,20 +2,23 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
+
+	"net/http"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-	"net/http"
 )
 
 var (
@@ -45,10 +48,29 @@ type DestinationConn struct {
 	addr string
 }
 
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 65536)
+	},
+}
+
+var debugLog int32 = 1
+
+func setDebugLog(value bool) {
+	if value {
+		atomic.StoreInt32(&debugLog, 1)
+	} else {
+		atomic.StoreInt32(&debugLog, 0)
+	}
+}
+
+func isDebugLog() bool {
+	return atomic.LoadInt32(&debugLog) == 1
+}
+
 func main() {
 	setupLogger()
 
-	// Check if Go metrics should be enabled
 	enableGoMetrics := os.Getenv("PROM_GO_METRICS")
 	if enableGoMetrics == "true" {
 		registry.MustRegister(collectors.NewGoCollector())
@@ -101,14 +123,12 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 
-	// Start UDP handling
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		handleConnections(ctx, conn, destConns)
 	}()
 
-	// Start metrics server
 	srv := &http.Server{Addr: ":8080"}
 	http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
 	go func() {
@@ -117,36 +137,30 @@ func main() {
 		}
 	}()
 
-	// Wait for interrupt signal
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
 
 	log.Info().Msg("Shutting down...")
 
-	// Shutdown gracefully
 	cancel()
 
-	// Close UDP listener
 	if err := conn.Close(); err != nil {
 		log.Error().Err(err).Msg("Error closing UDP listener")
 	}
 
-	// Close destination connections
 	for _, destConn := range destConns {
 		if err := destConn.conn.Close(); err != nil {
 			log.Error().Err(err).Str("destination", destConn.addr).Msg("Error closing destination connection")
 		}
 	}
 
-	// Shutdown metrics server
 	ctxShutdown, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelShutdown()
 	if err := srv.Shutdown(ctxShutdown); err != nil {
 		log.Error().Err(err).Msg("Metrics server shutdown failed")
 	}
 
-	// Wait for goroutines to finish
 	wg.Wait()
 
 	log.Info().Msg("Server stopped")
@@ -165,48 +179,66 @@ func setupLogger() {
 
 	zerolog.SetGlobalLevel(level)
 
-	// Configure zerolog to output JSON
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger()
 }
 
 func handleConnections(ctx context.Context, conn UDPConn, destConns []DestinationConn) {
-	buffer := make([]byte, 1024)
-
 	for {
 		select {
 		case <-ctx.Done():
 			log.Debug().Msg("Stopping UDP packet handling")
 			return
 		default:
-			err := conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+			buffer := bufferPool.Get().([]byte)
+			n, remoteAddr, err := readPacket(ctx, conn, buffer)
 			if err != nil {
-				log.Error().Err(err).Msg("Error setting read deadline")
-				continue
-			}
-
-			n, remoteAddr, err := conn.ReadFromUDP(buffer)
-			if err != nil {
-				if ctx.Err() != nil {
-					// Context cancelled, time to exit
+				bufferPool.Put(buffer)
+				if err == errContextCanceled {
 					return
 				}
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					// This is a timeout, just continue to the next iteration
-					continue
-				}
-				// Log other errors, but don't exit
-				log.Error().Err(err).Msg("Error reading UDP packet")
 				continue
 			}
 
 			packetsReceived.Inc()
 			log.Debug().Str("remote_addr", remoteAddr.String()).Int("bytes", n).Msg("Received packet")
 
-			for _, destConn := range destConns {
-				go forwardPacket(buffer[:n], destConn)
-			}
+			packetCopy := make([]byte, n)
+			copy(packetCopy, buffer[:n])
+
+			forwardPackets(packetCopy, destConns)
+			bufferPool.Put(buffer)
 		}
+	}
+}
+
+func readPacket(ctx context.Context, conn UDPConn, buffer []byte) (int, *net.UDPAddr, error) {
+	for {
+		err := conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		if err != nil {
+			log.Error().Err(err).Msg("Error setting read deadline")
+			continue
+		}
+
+		n, remoteAddr, err := conn.ReadFromUDP(buffer)
+		if err != nil {
+			if ctx.Err() != nil {
+				return 0, nil, errContextCanceled
+			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			log.Error().Err(err).Msg("Error reading UDP packet")
+			continue
+		}
+
+		return n, remoteAddr, nil
+	}
+}
+
+func forwardPackets(packet []byte, destConns []DestinationConn) {
+	for _, destConn := range destConns {
+		go forwardPacket(packet, destConn)
 	}
 }
 
@@ -214,26 +246,33 @@ func forwardPacket(packet []byte, destConn DestinationConn) {
 	var n int
 	var err error
 
-	log.Debug().Str("destination", destConn.addr).Int("packet_size", len(packet)).Msg("Attempting to forward packet")
+	if isDebugLog() {
+		log.Debug().Str("destination", destConn.addr).Int("packet_size", len(packet)).Msg("Attempting to forward packet")
+	}
 
-	// Check if the connection is a UDP connection
 	if udpConn, ok := destConn.conn.(*net.UDPConn); ok {
 		n, err = udpConn.Write(packet)
 	} else {
-		// For other types of connections, use Write
 		n, err = destConn.conn.Write(packet)
 	}
 
 	if err != nil {
-		log.Error().Err(err).Str("destination", destConn.addr).Int("packet_size", len(packet)).Msg("Error forwarding packet")
+		if isDebugLog() {
+			log.Error().Err(err).Str("destination", destConn.addr).Int("packet_size", len(packet)).Msg("Error forwarding packet")
+		}
 		return
 	}
 
-	if n != len(packet) {
+	if n != len(packet) && isDebugLog() {
 		log.Warn().Str("destination", destConn.addr).Int("sent", n).Int("expected", len(packet)).Msg("Incomplete packet sent")
 	}
 
 	packetsForwarded.WithLabelValues(destConn.addr).Inc()
 	bytesForwarded.WithLabelValues(destConn.addr).Add(float64(n))
-	log.Debug().Str("destination", destConn.addr).Int("bytes", n).Msg("Forwarded packet")
+
+	if isDebugLog() {
+		log.Debug().Str("destination", destConn.addr).Int("bytes", n).Msg("Forwarded packet")
+	}
 }
+
+var errContextCanceled = errors.New("context canceled")

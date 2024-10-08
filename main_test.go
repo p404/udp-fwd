@@ -3,27 +3,27 @@ package main
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/golang/mock/gomock"
+	"github.com/rs/zerolog"
+	"github.com/schollz/progressbar/v3"
 	"github.com/stretchr/testify/assert"
 )
 
-//go:generate mockgen -source=types.go -destination=mock_udp_conn.go -package=main
-
 func TestMain(m *testing.M) {
-	// Setup
 	os.Setenv("UDP_LISTEN_PORT", "5000")
 	os.Setenv("UDP_DESTINATIONS", "localhost:6000,localhost:6001")
-	os.Setenv("LOG_LEVEL", "debug") // Set to debug for more detailed logging
+	os.Setenv("LOG_LEVEL", "debug")
 
-	// Run tests
 	code := m.Run()
 
-	// Teardown
 	os.Unsetenv("UDP_LISTEN_PORT")
 	os.Unsetenv("UDP_DESTINATIONS")
 	os.Unsetenv("LOG_LEVEL")
@@ -32,23 +32,19 @@ func TestMain(m *testing.M) {
 }
 
 func TestHandleConnections(t *testing.T) {
-	// Setup
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
 	mockConn := NewMockUDPConn(ctrl)
 
-	// Create real UDP connections for destinations
 	destConns := make([]DestinationConn, 2)
 	for i := range destConns {
-		// Create a mock server to receive packets
 		serverAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
 		assert.NoError(t, err)
 		serverConn, err := net.ListenUDP("udp", serverAddr)
 		assert.NoError(t, err)
 		defer serverConn.Close()
 
-		// Create a client connection to the mock server
 		clientConn, err := net.DialUDP("udp", nil, serverConn.LocalAddr().(*net.UDPAddr))
 		assert.NoError(t, err)
 		defer clientConn.Close()
@@ -61,33 +57,24 @@ func TestHandleConnections(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Expectations
 	packet := []byte("test packet")
 	remoteAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 54321}
 	mockConn.EXPECT().SetReadDeadline(gomock.Any()).Return(nil).AnyTimes()
 	mockConn.EXPECT().ReadFromUDP(gomock.Any()).DoAndReturn(func(b []byte) (int, *net.UDPAddr, error) {
-		copy(b, packet)
-		return len(packet), remoteAddr, nil
+		n := copy(b, packet)
+		return n, remoteAddr, nil
 	}).AnyTimes()
 
-	// Run the function in a goroutine
 	go handleConnections(ctx, mockConn, destConns)
 
-	// Wait a bit for the goroutine to process
 	time.Sleep(100 * time.Millisecond)
 
-	// Signal to stop
 	cancel()
 
-	// Wait for the goroutine to finish
 	time.Sleep(100 * time.Millisecond)
-
-	// Assertions
-	// You can add assertions here to check if packets were received by the destination connections
 }
 
 func TestForwardPacket(t *testing.T) {
-	// Setup mock UDP server
 	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
 	assert.NoError(t, err)
 
@@ -95,7 +82,6 @@ func TestForwardPacket(t *testing.T) {
 	assert.NoError(t, err)
 	defer serverConn.Close()
 
-	// Create a DestinationConn
 	clientConn, err := net.DialUDP("udp", nil, serverConn.LocalAddr().(*net.UDPAddr))
 	assert.NoError(t, err)
 	defer clientConn.Close()
@@ -105,16 +91,13 @@ func TestForwardPacket(t *testing.T) {
 		addr: clientConn.RemoteAddr().String(),
 	}
 
-	// Run forwardPacket
 	packet := []byte("test packet")
 	forwardPacket(packet, destConn)
 
-	// Read from the server
 	buffer := make([]byte, 1024)
 	serverConn.SetReadDeadline(time.Now().Add(1 * time.Second))
 	n, _, err := serverConn.ReadFromUDP(buffer)
 
-	// Assertions
 	if err != nil {
 		t.Logf("Error reading from UDP: %v", err)
 	}
@@ -126,7 +109,6 @@ func TestForwardPacket(t *testing.T) {
 }
 
 func TestForwardPacketsWithDifferentSizes(t *testing.T) {
-	// Setup mock UDP servers (destinations)
 	destCount := 2
 	servers := make([]*net.UDPConn, destCount)
 	destConns := make([]DestinationConn, destCount)
@@ -151,7 +133,6 @@ func TestForwardPacketsWithDifferentSizes(t *testing.T) {
 		}
 	}
 
-	// Test different packet sizes
 	testSizes := []int{10, 100, 500, 1000, 1500}
 
 	for _, size := range testSizes {
@@ -161,14 +142,12 @@ func TestForwardPacketsWithDifferentSizes(t *testing.T) {
 				packet[i] = byte(i % 256)
 			}
 
-			// Forward packet to all destinations
-			for _, destConn := range destConns {
-				forwardPacket(packet, destConn)
-			}
+			forwardPackets(packet, destConns)
 
-			// Check if all destinations received the correct packet
+			time.Sleep(100 * time.Millisecond) // Give some time for packets to be forwarded
+
 			for i, server := range servers {
-				buffer := make([]byte, 2000) // Larger than the max test size
+				buffer := make([]byte, 2000)
 				server.SetReadDeadline(time.Now().Add(1 * time.Second))
 				n, _, err := server.ReadFromUDP(buffer)
 
@@ -180,4 +159,115 @@ func TestForwardPacketsWithDifferentSizes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHighLoadStatsdMetrics(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping high load test in short mode")
+	}
+
+	// Disable all logging for this test
+	originalLogLevel := zerolog.GlobalLevel()
+	zerolog.SetGlobalLevel(zerolog.Disabled)
+	defer zerolog.SetGlobalLevel(originalLogLevel)
+
+	// Setup
+	serverAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	assert.NoError(t, err)
+	serverConn, err := net.ListenUDP("udp", serverAddr)
+	assert.NoError(t, err)
+	defer serverConn.Close()
+
+	clientConn, err := net.DialUDP("udp", nil, serverConn.LocalAddr().(*net.UDPAddr))
+	assert.NoError(t, err)
+	defer clientConn.Close()
+
+	destConn := DestinationConn{
+		conn: clientConn,
+		addr: serverConn.LocalAddr().String(),
+	}
+
+	// Test parameters
+	metricsPerSecond := 100000
+	testDuration := 5 * time.Minute
+	totalMetrics := metricsPerSecond * int(testDuration.Seconds())
+
+	fmt.Printf("Starting load test: sending %d metrics/second for %v\n", metricsPerSecond, testDuration)
+	fmt.Printf("Listening on %s\n", serverConn.LocalAddr().String())
+
+	ctx, cancel := context.WithTimeout(context.Background(), testDuration)
+	defer cancel()
+
+	var sentCount, receivedCount int64
+	var wg sync.WaitGroup
+
+	// Progress bar
+	bar := progressbar.NewOptions(totalMetrics,
+		progressbar.OptionSetDescription("Sending metrics"),
+		progressbar.OptionSetWidth(50),
+		progressbar.OptionThrottle(65*time.Millisecond),
+		progressbar.OptionShowCount(),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Println("\nLoad test completed")
+		}),
+	)
+
+	// Sending goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				for i := 0; i < metricsPerSecond; i++ {
+					metric := fmt.Sprintf("test.metric:%d|c", rand.Intn(100))
+					forwardPacket([]byte(metric), destConn)
+					atomic.AddInt64(&sentCount, 1)
+					bar.Add(1)
+				}
+			}
+		}
+	}()
+
+	// Receiving goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buffer := make([]byte, 65536)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				serverConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+				n, _, err := serverConn.ReadFromUDP(buffer)
+				if err != nil {
+					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+						continue
+					}
+					if ctx.Err() != nil {
+						return
+					}
+					continue
+				}
+				atomic.AddInt64(&receivedCount, 1)
+				assert.True(t, n > 0, "Received empty packet")
+			}
+		}
+	}()
+
+	// Wait for test completion
+	wg.Wait()
+
+	// Assert results
+	sentFinal := atomic.LoadInt64(&sentCount)
+	receivedFinal := atomic.LoadInt64(&receivedCount)
+	fmt.Printf("\nTest completed. Sent: %d, Received: %d, Duration: %v\n", sentFinal, receivedFinal, testDuration)
+	assert.InDelta(t, totalMetrics, sentFinal, float64(totalMetrics)*0.1, "Incorrect number of metrics sent")
+	assert.InDelta(t, sentFinal, receivedFinal, float64(sentFinal)*0.1, "More than 10% packet loss")
 }
