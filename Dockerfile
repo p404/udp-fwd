@@ -11,4 +11,6 @@ COPY --from=builder /app/udp-fwd .
 EXPOSE 8125/udp
 EXPOSE 8080
 
+LABEL org.opencontainers.image.description="UDP server that forwards incoming packets to multiple destinations"
+
 CMD ["./udp-fwd"]
